@@ -14,24 +14,47 @@ use crate::error::ApplicationClose;
 use std::future::pending;
 
 pub struct ConnectStream {
-    stream: Option<StreamSession>,
+    // The stream is read by a task of its own, which ends with the stream's last word:
+    // the driver's select! drops `run` at every other event, and a frame read dropped
+    // halfway would lose bytes.
+    done: Option<tokio::sync::oneshot::Receiver<DriverError>>,
 }
 
 impl ConnectStream {
     pub fn empty() -> Self {
-        Self { stream: None }
+        Self { done: None }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stream.is_none()
+        self.done.is_none()
     }
 
     pub fn set_stream(&mut self, stream: StreamSession) {
-        self.stream = Some(stream);
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut slot = Some(stream);
+            // Ends with the driver, which drops the receiver: the stream it holds
+            // would keep the connection open
+            let end = tokio::select! {
+                end = Self::read_until_end(&mut slot) => Some(end),
+                () = tx.closed() => None,
+            };
+            if let Some(end) = end {
+                let _ = tx.send(end);
+            }
+        });
+        self.done = Some(rx);
     }
 
     pub async fn run(&mut self) -> DriverError {
-        let stream = match self.stream.as_mut() {
+        match self.done.as_mut() {
+            Some(done) => done.await.unwrap_or(DriverError::NotConnected),
+            None => pending().await,
+        }
+    }
+
+    async fn read_until_end(slot: &mut Option<StreamSession>) -> DriverError {
+        let stream = match slot.as_mut() {
             Some(stream) => stream,
             None => pending().await,
         };
@@ -72,10 +95,7 @@ impl ConnectStream {
                         };
 
                     // reset right away to avoid receiving additional data which requires resetting with ErrorCode::Message.
-                    self.stream
-                        .take()
-                        .unwrap()
-                        .reset(ErrorCode::NoError.to_code());
+                    slot.take().unwrap().reset(ErrorCode::NoError.to_code());
 
                     DriverError::ApplicationClosed(ApplicationClose::new(
                         close_session.error_code(),

@@ -76,25 +76,43 @@ impl LocalSettingsStream {
 }
 
 pub struct RemoteSettingsStream {
-    stream: Option<StreamUniRemoteH3>,
+    // Frames read by a task of their own: a read dropped halfway (the driver's
+    // select! drops this future at every other event) would lose bytes.
+    frames: Option<tokio::sync::mpsc::Receiver<Result<Frame<'static>, DriverError>>>,
     settings: watch::Sender<Option<Settings>>,
 }
 
 impl RemoteSettingsStream {
     pub fn empty() -> Self {
         Self {
-            stream: None,
+            frames: None,
             settings: watch::channel(None).0,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stream.is_none()
+        self.frames.is_none()
     }
 
     pub fn set_stream(&mut self, stream: StreamUniRemoteH3) {
         assert!(matches!(stream.kind(), StreamKind::Control));
-        self.stream = Some(stream);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let mut stream = stream;
+            loop {
+                // Ends with the driver, which drops the receiver: the stream it holds
+                // would keep the connection open
+                let frame = tokio::select! {
+                    frame = Self::read_one(&mut stream) => frame,
+                    () = tx.closed() => return,
+                };
+                let end = frame.is_err();
+                if tx.send(frame).await.is_err() || end {
+                    return;
+                }
+            }
+        });
+        self.frames = Some(rx);
     }
 
     pub fn subscribe(&self) -> RemoteSettingsWatcher {
@@ -125,11 +143,17 @@ impl RemoteSettingsStream {
         }
     }
 
-    async fn read_frame<'a>(&mut self) -> Result<Frame<'a>, DriverError> {
-        let Some(stream) = self.stream.as_mut() else {
+    async fn read_frame(&mut self) -> Result<Frame<'static>, DriverError> {
+        let Some(frames) = self.frames.as_mut() else {
             return pending().await;
         };
+        frames
+            .recv()
+            .await
+            .unwrap_or(Err(DriverError::NotConnected))
+    }
 
+    async fn read_one(stream: &mut StreamUniRemoteH3) -> Result<Frame<'static>, DriverError> {
         match stream.read_frame().await {
             Ok(frame) => Ok(frame),
             Err(ProtoReadError::H3(error_code)) => Err(DriverError::Proto(error_code)),
